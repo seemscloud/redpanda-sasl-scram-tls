@@ -1,0 +1,11 @@
+redpanda:
+  nodeSelector: {}
+  tolerations: []
+
+console:
+  nodeSelector: {}
+  tolerations: []
+
+producer:
+  nodeSelector: {}
+  tolerations: []

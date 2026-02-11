@@ -3,18 +3,36 @@ kind: Console
 metadata:
   name: redpanda
 spec:
+  {{- with .Values.console.nodeSelector }}
   nodeSelector:
-    node-role.kubernetes.io/elastic: ""
+    {{- include "common.tplvalues.render" (dict "value" . "context" $) | nindent 2 | indent 2 }}
+  {{- end }}
+  {{- with .Values.console.tolerations }}
   tolerations:
-  - key: node-role.kubernetes.io/elastic
-    operator: Exists
-    effect: NoSchedule
+    {{- include "common.tplvalues.render" (dict "value" . "context" $) | nindent 2 }}
+  {{- end }}
   replicaCount: 3
   strategy:
     type: RollingUpdate
     rollingUpdate:
       maxUnavailable: 0
       maxSurge: "100%"
+  ingress:
+    enabled: true
+    className: nginx-internal
+    annotations:
+      cert-manager.io/cluster-issuer: cloudflare
+      external-dns.alpha.kubernetes.io/hostname: redpanda-console-secure.psem.io
+      external-dns.alpha.kubernetes.io/ttl: "60"
+    hosts:
+    - host: redpanda-console-secure.psem.io
+      paths:
+      - path: /
+        pathType: ImplementationSpecific
+    tls:
+    - hosts:
+      - redpanda-console-secure.psem.io
+      secretName: redpanda-console-secure-ingress-tls
   cluster:
     staticConfiguration:
       kafka:

@@ -7,12 +7,21 @@ spec:
   clusterSpec:
     statefulset:
       replicas: 3
+      {{- with .Values.redpanda.nodeSelector }}
       nodeSelector:
-        node-role.kubernetes.io/elastic: ""
+        {{- include "common.tplvalues.render" (dict "value" . "context" $) | nindent 6 | indent 2 }}
+      {{- end }}
+      {{- with .Values.redpanda.tolerations }}
       tolerations:
-      - key: node-role.kubernetes.io/elastic
-        operator: Exists
-        effect: NoSchedule
+        {{- include "common.tplvalues.render" (dict "value" . "context" $) | nindent 6 }}
+      {{- end }}
+      podAntiAffinity:
+        type: soft
+        topologyKey: kubernetes.io/hostname
+    storage:
+      persistentVolume:
+        storageClass: premium-rwo
+        size: 10Gi
     resources:
       requests:
         cpu: "1"

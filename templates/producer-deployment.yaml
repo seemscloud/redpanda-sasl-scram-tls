@@ -21,12 +21,14 @@ spec:
         app.kubernetes.io/name: redpanda-producer
     spec:
       automountServiceAccountToken: false
+      {{- with .Values.producer.nodeSelector }}
       nodeSelector:
-        node-role.kubernetes.io/elastic: ""
+        {{- include "common.tplvalues.render" (dict "value" . "context" $) | nindent 6 | indent 2 }}
+      {{- end }}
+      {{- with .Values.producer.tolerations }}
       tolerations:
-      - key: node-role.kubernetes.io/elastic
-        operator: Exists
-        effect: NoSchedule
+        {{- include "common.tplvalues.render" (dict "value" . "context" $) | nindent 6 }}
+      {{- end }}
       securityContext:
         seccompProfile:
           type: RuntimeDefault
@@ -36,7 +38,16 @@ spec:
         imagePullPolicy: IfNotPresent
         command:
         - /bin/sh
-        - /opt/redpanda-producer/producer.sh
+        - -ec
+        - |
+          if command -v python3 >/dev/null 2>&1; then
+            exec python3 /opt/redpanda-producer/producer.py
+          elif command -v python >/dev/null 2>&1; then
+            exec python /opt/redpanda-producer/producer.py
+          else
+            echo "python runtime not found in the producer image" >&2
+            exit 1
+          fi
         env:
         - name: NAMESPACE
           valueFrom:

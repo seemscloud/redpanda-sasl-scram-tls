@@ -5,112 +5,171 @@ metadata:
   labels:
     app.kubernetes.io/name: redpanda-producer
 data:
-  producer.sh: |
-    #!/usr/bin/env sh
-    set -eu
+  producer.py: |
+    #!/usr/bin/env python3
+    import json
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+    from datetime import datetime, timezone
 
-    log() {
-      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [redpanda-producer] $*"
-    }
+    STOP = False
 
-    TOPIC="${TOPIC:-logs}"
-    BROKER_SERVICE="${BROKER_SERVICE:-redpanda}"
-    BROKER_PORT="${BROKER_PORT:-9093}"
-    NAMESPACE="${NAMESPACE:-default}"
-    BROKER="${BROKER_SERVICE}.${NAMESPACE}.svc.cluster.local.:${BROKER_PORT}"
 
-    KAFKA_USERNAME="${KAFKA_USERNAME:-producer}"
-    KAFKA_PASSWORD_FILE="${KAFKA_PASSWORD_FILE:-/etc/redpanda/auth/password}"
-    CA_FILE="${CA_FILE:-/etc/redpanda/certs/ca.crt}"
+    def log(message):
+      ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+      print(f"{ts} [redpanda-producer] {message}", flush=True)
 
-    # 10 messages every 0.1s ~= 100 messages/s.
-    MESSAGES_PER_BATCH="${MESSAGES_PER_BATCH:-10}"
-    BATCH_INTERVAL_SECONDS="${BATCH_INTERVAL_SECONDS:-0.1}"
-    MAX_BACKOFF_SECONDS="${MAX_BACKOFF_SECONDS:-30}"
 
-    if [ "${MESSAGES_PER_BATCH}" -lt 1 ]; then
-      log "MESSAGES_PER_BATCH must be >= 1"
-      exit 1
-    fi
+    def on_term(_signum, _frame):
+      global STOP
+      STOP = True
+      log("Received termination signal. Exiting.")
 
-    wait_for_dependencies() {
-      while [ ! -s "${KAFKA_PASSWORD_FILE}" ] || [ ! -s "${CA_FILE}" ]; do
-        log "Waiting for mounted secrets (${KAFKA_PASSWORD_FILE}, ${CA_FILE})..."
-        sleep 2
-      done
-    }
 
-    read_password() {
-      tr -d '\r\n' < "${KAFKA_PASSWORD_FILE}"
-    }
+    def sleep_interruptible(seconds):
+      end = time.time() + seconds
+      while not STOP and time.time() < end:
+        time.sleep(min(0.2, end - time.time()))
 
-    check_cluster() {
-      password="$(read_password)"
-      rpk cluster info \
-        -X brokers="${BROKER}" \
-        -X user="${KAFKA_USERNAME}" \
-        -X pass="${password}" \
-        -X sasl.mechanism=SCRAM-SHA-512 \
-        -X tls.enabled=true \
-        -X tls.ca="${CA_FILE}" >/dev/null 2>&1
-    }
 
-    generate_messages() {
-      seq=0
-      while true; do
-        i=0
-        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        while [ "${i}" -lt "${MESSAGES_PER_BATCH}" ]; do
-          seq=$((seq + 1))
-          printf '{"producer":"redpanda-producer","topic":"%s","sequence":%s,"sent_at":"%s"}\n' "${TOPIC}" "${seq}" "${now}"
-          i=$((i + 1))
-        done
-        sleep "${BATCH_INTERVAL_SECONDS}"
-      done
-    }
+    signal.signal(signal.SIGINT, on_term)
+    signal.signal(signal.SIGTERM, on_term)
 
-    stream_messages() {
-      password="$(read_password)"
-      generate_messages | rpk topic produce "${TOPIC}" -f '%v\n' \
-        -X brokers="${BROKER}" \
-        -X user="${KAFKA_USERNAME}" \
-        -X pass="${password}" \
-        -X sasl.mechanism=SCRAM-SHA-512 \
-        -X tls.enabled=true \
-        -X tls.ca="${CA_FILE}"
-    }
+    TOPIC = os.getenv("TOPIC", "logs")
+    BROKER_SERVICE = os.getenv("BROKER_SERVICE", "redpanda")
+    BROKER_PORT = os.getenv("BROKER_PORT", "9093")
+    NAMESPACE = os.getenv("NAMESPACE", "default")
+    BROKER = f"{BROKER_SERVICE}.{NAMESPACE}.svc.cluster.local.:{BROKER_PORT}"
 
-    on_term() {
-      log "Received termination signal. Exiting."
-      exit 0
-    }
+    KAFKA_USERNAME = os.getenv("KAFKA_USERNAME", "producer")
+    KAFKA_PASSWORD_FILE = os.getenv("KAFKA_PASSWORD_FILE", "/etc/redpanda/auth/password")
+    CA_FILE = os.getenv("CA_FILE", "/etc/redpanda/certs/ca.crt")
 
-    trap on_term INT TERM
+    try:
+      MESSAGES_PER_BATCH = int(os.getenv("MESSAGES_PER_BATCH", "10"))
+    except ValueError:
+      log("MESSAGES_PER_BATCH must be an integer.")
+      sys.exit(1)
 
-    wait_for_dependencies
-    log "Producer configured. topic=${TOPIC} broker=${BROKER} user=${KAFKA_USERNAME}"
-    log "Target throughput: ~100 msg/s (MESSAGES_PER_BATCH=${MESSAGES_PER_BATCH}, BATCH_INTERVAL_SECONDS=${BATCH_INTERVAL_SECONDS})"
+    try:
+      BATCH_INTERVAL_SECONDS = float(os.getenv("BATCH_INTERVAL_SECONDS", "0.1"))
+    except ValueError:
+      log("BATCH_INTERVAL_SECONDS must be a number.")
+      sys.exit(1)
 
-    backoff=1
-    while true; do
-      if ! check_cluster; then
-        log "Connectivity check failed (DNS/network/TLS/SASL). Retrying in ${backoff}s."
-        sleep "${backoff}"
-        backoff=$((backoff * 2))
-        if [ "${backoff}" -gt "${MAX_BACKOFF_SECONDS}" ]; then
-          backoff="${MAX_BACKOFF_SECONDS}"
-        fi
-        continue
-      fi
+    try:
+      MAX_BACKOFF_SECONDS = int(os.getenv("MAX_BACKOFF_SECONDS", "30"))
+    except ValueError:
+      log("MAX_BACKOFF_SECONDS must be an integer.")
+      sys.exit(1)
 
-      backoff=1
-      log "Connected to Redpanda. Starting producer stream."
-      if ! stream_messages; then
-        log "Producer stream interrupted. Retrying in ${backoff}s."
-        sleep "${backoff}"
-        backoff=$((backoff * 2))
-        if [ "${backoff}" -gt "${MAX_BACKOFF_SECONDS}" ]; then
-          backoff="${MAX_BACKOFF_SECONDS}"
-        fi
-      fi
-    done
+    if MESSAGES_PER_BATCH < 1:
+      log("MESSAGES_PER_BATCH must be >= 1")
+      sys.exit(1)
+
+
+    def wait_for_dependencies():
+      while not STOP:
+        password_ready = os.path.isfile(KAFKA_PASSWORD_FILE) and os.path.getsize(KAFKA_PASSWORD_FILE) > 0
+        ca_ready = os.path.isfile(CA_FILE) and os.path.getsize(CA_FILE) > 0
+        if password_ready and ca_ready:
+          return True
+        log(f"Waiting for mounted secrets ({KAFKA_PASSWORD_FILE}, {CA_FILE})...")
+        sleep_interruptible(2)
+      return False
+
+
+    def read_password():
+      with open(KAFKA_PASSWORD_FILE, "r", encoding="utf-8") as password_file:
+        return password_file.read().strip()
+
+
+    def rpk_auth_args(password):
+      return [
+        "-X", f"brokers={BROKER}",
+        "-X", f"user={KAFKA_USERNAME}",
+        "-X", f"pass={password}",
+        "-X", "sasl.mechanism=SCRAM-SHA-512",
+        "-X", "tls.enabled=true",
+        "-X", f"tls.ca={CA_FILE}",
+      ]
+
+
+    def check_cluster():
+      password = read_password()
+      cmd = ["rpk", "cluster", "info", *rpk_auth_args(password)]
+      result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+      return result.returncode == 0
+
+
+    def build_batch(sequence):
+      now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+      payload_lines = []
+      for _ in range(MESSAGES_PER_BATCH):
+        sequence += 1
+        payload_lines.append(json.dumps({
+          "producer": "redpanda-producer",
+          "topic": TOPIC,
+          "sequence": sequence,
+          "sent_at": now,
+        }, separators=(",", ":")))
+      return sequence, ("\n".join(payload_lines) + "\n").encode("utf-8")
+
+
+    def produce_batch(sequence):
+      password = read_password()
+      sequence, payload = build_batch(sequence)
+      cmd = ["rpk", "topic", "produce", TOPIC, "-f", "%v\n", *rpk_auth_args(password)]
+      result = subprocess.run(cmd, input=payload, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False)
+      if result.returncode != 0:
+        details = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(details or "rpk topic produce failed")
+      return sequence
+
+
+    def main():
+      if not wait_for_dependencies():
+        return 0
+
+      log(f"Producer configured. topic={TOPIC} broker={BROKER} user={KAFKA_USERNAME}")
+      log(
+        "Target throughput: ~100 msg/s "
+        f"(MESSAGES_PER_BATCH={MESSAGES_PER_BATCH}, BATCH_INTERVAL_SECONDS={BATCH_INTERVAL_SECONDS})"
+      )
+
+      backoff = 1
+      sequence = 0
+
+      while not STOP:
+        if not check_cluster():
+          log(f"Connectivity check failed (DNS/network/TLS/SASL). Retrying in {backoff}s.")
+          sleep_interruptible(backoff)
+          backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+          continue
+
+        backoff = 1
+        log("Connected to Redpanda. Starting producer stream.")
+
+        try:
+          while not STOP:
+            sequence = produce_batch(sequence)
+            sleep_interruptible(BATCH_INTERVAL_SECONDS)
+        except Exception as err:
+          if STOP:
+            break
+          log(f"Producer stream interrupted. Retrying in {backoff}s. Reason: {err}")
+          sleep_interruptible(backoff)
+          backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+
+      return 0
+
+
+    if __name__ == "__main__":
+      try:
+        sys.exit(main())
+      except Exception as err:
+        log(f"Fatal error: {err}")
+        sys.exit(1)
