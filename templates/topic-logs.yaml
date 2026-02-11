@@ -3,6 +3,8 @@ kind: Topic
 metadata:
   name: logs
 spec:
+  additionalConfig:
+    retention.ms: "60000"
   cluster:
     staticConfiguration:
       kafka:

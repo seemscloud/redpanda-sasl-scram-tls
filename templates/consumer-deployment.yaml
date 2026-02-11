@@ -1,15 +1,15 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: producer
+  name: consumer
   labels:
-    app.kubernetes.io/name: producer
+    app.kubernetes.io/name: consumer
 spec:
   replicas: 1
   revisionHistoryLimit: 2
   selector:
     matchLabels:
-      app.kubernetes.io/name: producer
+      app.kubernetes.io/name: consumer
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -18,16 +18,16 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: producer
+        app.kubernetes.io/name: consumer
       annotations:
-        checksum/config: {{ include (print $.Template.BasePath "/producer-configmap.yaml") . | sha256sum }}
+        checksum/config: {{ include (print $.Template.BasePath "/consumer-configmap.yaml") . | sha256sum }}
     spec:
       automountServiceAccountToken: false
-      {{- with .Values.producer.nodeSelector }}
+      {{- with .Values.consumer.nodeSelector }}
       nodeSelector:
         {{- include "common.tplvalues.render" (dict "value" . "context" $) | nindent 6 | indent 2 }}
       {{- end }}
-      {{- with .Values.producer.tolerations }}
+      {{- with .Values.consumer.tolerations }}
       tolerations:
         {{- include "common.tplvalues.render" (dict "value" . "context" $) | nindent 6 }}
       {{- end }}
@@ -35,7 +35,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-      - name: producer
+      - name: consumer
         image: python:3.13-slim
         imagePullPolicy: IfNotPresent
         command:
@@ -43,7 +43,7 @@ spec:
         - -ec
         - |
           python -m pip install --no-cache-dir --user confluent-kafka
-          exec python /opt/redpanda-producer/producer.py
+          exec python /opt/redpanda-consumer/consumer.py
         env:
         - name: NAMESPACE
           valueFrom:
@@ -56,15 +56,21 @@ spec:
         - name: BROKER_PORT
           value: "9093"
         - name: KAFKA_USERNAME
-          value: producer
+          value: consumer
         - name: KAFKA_PASSWORD_FILE
           value: /etc/redpanda/auth/password
         - name: CA_FILE
           value: /etc/redpanda/certs/ca.crt
-        - name: MESSAGES_PER_BATCH
-          value: "10"
-        - name: BATCH_INTERVAL_SECONDS
-          value: "0.1"
+        - name: GROUP_ID
+          value: logs-consumer
+        - name: AUTO_OFFSET_RESET
+          value: earliest
+        - name: POLL_TIMEOUT_MS
+          value: "1000"
+        - name: MAX_RECORDS_PER_POLL
+          value: "100"
+        - name: MIN_MESSAGES_PER_BATCH
+          value: "100"
         - name: MAX_BACKOFF_SECONDS
           value: "30"
         - name: PYTHONDONTWRITEBYTECODE
@@ -89,8 +95,8 @@ spec:
           runAsUser: 1000
           runAsGroup: 1000
         volumeMounts:
-        - name: producer-script
-          mountPath: /opt/redpanda-producer
+        - name: consumer-script
+          mountPath: /opt/redpanda-consumer
           readOnly: true
         - name: kafka-auth
           mountPath: /etc/redpanda/auth
@@ -99,12 +105,12 @@ spec:
           mountPath: /etc/redpanda/certs
           readOnly: true
       volumes:
-      - name: producer-script
+      - name: consumer-script
         configMap:
-          name: producer
+          name: consumer
       - name: kafka-auth
         secret:
-          secretName: producer-creds
+          secretName: consumer-creds
           items:
           - key: password
             path: password

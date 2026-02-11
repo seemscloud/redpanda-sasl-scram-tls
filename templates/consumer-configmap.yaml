@@ -1,26 +1,25 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: producer
+  name: consumer
   labels:
-    app.kubernetes.io/name: producer
+    app.kubernetes.io/name: consumer
 data:
-  producer.py: |
+  consumer.py: |
     #!/usr/bin/env python3
-    import json
     import os
     import signal
     import sys
     import time
     from datetime import datetime, timezone
-    from confluent_kafka import Producer
+    from confluent_kafka import Consumer, KafkaError
 
     STOP = False
 
 
     def log(message):
       ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-      print(f"{ts} [producer] {message}", flush=True)
+      print(f"{ts} [consumer] {message}", flush=True)
 
 
     def on_term(_signum, _frame):
@@ -44,20 +43,28 @@ data:
     NAMESPACE = os.getenv("NAMESPACE", "default")
     BROKER = f"{BROKER_SERVICE}.{NAMESPACE}.svc.cluster.local.:{BROKER_PORT}"
 
-    KAFKA_USERNAME = os.getenv("KAFKA_USERNAME", "producer")
+    KAFKA_USERNAME = os.getenv("KAFKA_USERNAME", "consumer")
     KAFKA_PASSWORD_FILE = os.getenv("KAFKA_PASSWORD_FILE", "/etc/redpanda/auth/password")
     CA_FILE = os.getenv("CA_FILE", "/etc/redpanda/certs/ca.crt")
+    GROUP_ID = os.getenv("GROUP_ID", "logs-consumer")
+    AUTO_OFFSET_RESET = os.getenv("AUTO_OFFSET_RESET", "earliest")
 
     try:
-      MESSAGES_PER_BATCH = int(os.getenv("MESSAGES_PER_BATCH", "10"))
+      POLL_TIMEOUT_MS = int(os.getenv("POLL_TIMEOUT_MS", "1000"))
     except ValueError:
-      log("MESSAGES_PER_BATCH must be an integer.")
+      log("POLL_TIMEOUT_MS must be an integer.")
       sys.exit(1)
 
     try:
-      BATCH_INTERVAL_SECONDS = float(os.getenv("BATCH_INTERVAL_SECONDS", "0.1"))
+      MAX_RECORDS_PER_POLL = int(os.getenv("MAX_RECORDS_PER_POLL", "100"))
     except ValueError:
-      log("BATCH_INTERVAL_SECONDS must be a number.")
+      log("MAX_RECORDS_PER_POLL must be an integer.")
+      sys.exit(1)
+
+    try:
+      MIN_MESSAGES_PER_BATCH = int(os.getenv("MIN_MESSAGES_PER_BATCH", "100"))
+    except ValueError:
+      log("MIN_MESSAGES_PER_BATCH must be an integer.")
       sys.exit(1)
 
     try:
@@ -66,9 +73,19 @@ data:
       log("MAX_BACKOFF_SECONDS must be an integer.")
       sys.exit(1)
 
-    if MESSAGES_PER_BATCH < 1:
-      log("MESSAGES_PER_BATCH must be >= 1")
+    if POLL_TIMEOUT_MS < 1:
+      log("POLL_TIMEOUT_MS must be >= 1")
       sys.exit(1)
+
+    if MAX_RECORDS_PER_POLL < 1:
+      log("MAX_RECORDS_PER_POLL must be >= 1")
+      sys.exit(1)
+
+    if MIN_MESSAGES_PER_BATCH < 1:
+      log("MIN_MESSAGES_PER_BATCH must be >= 1")
+      sys.exit(1)
+
+    POLL_TIMEOUT_SECONDS = POLL_TIMEOUT_MS / 1000.0
 
 
     def wait_for_dependencies():
@@ -87,122 +104,93 @@ data:
         return password_file.read().strip()
 
 
-    def create_producer():
+    def create_consumer():
       password = read_password()
-      return Producer({
+      consumer = Consumer({
         "bootstrap.servers": BROKER,
         "security.protocol": "SASL_SSL",
         "sasl.mechanism": "SCRAM-SHA-512",
         "sasl.username": KAFKA_USERNAME,
         "sasl.password": password,
         "ssl.ca.location": CA_FILE,
-        "acks": "all",
-        "enable.idempotence": True,
+        "group.id": GROUP_ID,
+        "auto.offset.reset": AUTO_OFFSET_RESET,
+        "enable.auto.commit": True,
       })
+      consumer.subscribe([TOPIC])
+      return consumer
 
 
-    def build_batch(sequence):
-      now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-      payloads = []
-      for _ in range(MESSAGES_PER_BATCH):
-        sequence += 1
-        payloads.append({
-          "producer": "producer",
-          "topic": TOPIC,
-          "sequence": sequence,
-          "sent_at": now,
-        })
-      return sequence, payloads
-
-
-    def can_access_topic(producer):
-      metadata = producer.list_topics(topic=TOPIC, timeout=10)
+    def can_access_topic(consumer):
+      metadata = consumer.list_topics(topic=TOPIC, timeout=10)
       topic_metadata = metadata.topics.get(TOPIC)
       if topic_metadata is not None and topic_metadata.error is not None:
         raise RuntimeError(f"Topic metadata error for {TOPIC}: {topic_metadata.error}")
       return True
 
 
-    def produce_batch(producer, sequence):
-      sequence, payloads = build_batch(sequence)
-      pending = 0
-      delivery_errors = []
+    def collect_batch(consumer):
+      batch_count = 0
+      while not STOP and batch_count < MIN_MESSAGES_PER_BATCH:
+        to_fetch = min(MAX_RECORDS_PER_POLL, MIN_MESSAGES_PER_BATCH - batch_count)
+        messages = consumer.consume(num_messages=to_fetch, timeout=POLL_TIMEOUT_SECONDS)
+        if not messages:
+          continue
 
-      def on_delivery(err, _msg):
-        nonlocal pending
-        pending -= 1
-        if err is not None:
-          delivery_errors.append(str(err))
+        for message in messages:
+          if message is None:
+            continue
 
-      for payload in payloads:
-        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        while not STOP:
-          try:
-            producer.produce(TOPIC, value=data, on_delivery=on_delivery)
-            pending += 1
-            break
-          except BufferError:
-            producer.poll(0.1)
-        producer.poll(0)
+          err = message.error()
+          if err is None:
+            batch_count += 1
+            continue
 
-      deadline = time.time() + 10
-      while pending > 0 and not STOP:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-          break
-        producer.poll(min(0.2, remaining))
+          if err.code() == KafkaError._PARTITION_EOF:
+            continue
 
-      if pending > 0:
-        undelivered = producer.flush(5)
-        pending = 0
-        if undelivered > 0:
-          raise RuntimeError(f"Timeout waiting for delivery of {undelivered} messages")
+          raise RuntimeError(f"Kafka consume error: {err}")
 
-      if delivery_errors:
-        raise RuntimeError(
-          f"Failed to deliver {len(delivery_errors)} messages. First error: {delivery_errors[0]}"
-        )
-
-      return sequence, len(payloads)
+      return batch_count
 
 
     def main():
       if not wait_for_dependencies():
         return 0
 
-      log(f"Producer configured. topic={TOPIC} broker={BROKER} user={KAFKA_USERNAME}")
       log(
-        "Target throughput: ~100 msg/s "
-        f"(MESSAGES_PER_BATCH={MESSAGES_PER_BATCH}, BATCH_INTERVAL_SECONDS={BATCH_INTERVAL_SECONDS})"
+        f"Consumer configured. topic={TOPIC} broker={BROKER} "
+        f"user={KAFKA_USERNAME} group={GROUP_ID} min_batch={MIN_MESSAGES_PER_BATCH}"
       )
 
       backoff = 1
-      sequence = 0
+      total = 0
 
       while not STOP:
-        producer = None
+        consumer = None
         try:
-          producer = create_producer()
-          if not can_access_topic(producer):
+          consumer = create_consumer()
+          if not can_access_topic(consumer):
             raise RuntimeError(f"Cannot access topic metadata: {TOPIC}")
-
           backoff = 1
-          log("Connected to Redpanda. Starting producer stream.")
+          log("Connected to Redpanda. Starting consumer stream.")
 
           while not STOP:
-            sequence, sent_count = produce_batch(producer, sequence)
-            log(f"Produced {sent_count} messages (total={sequence})")
-            sleep_interruptible(BATCH_INTERVAL_SECONDS)
+            consumed = collect_batch(consumer)
+            if consumed == 0:
+              continue
+            total += consumed
+            log(f"Consumed {consumed} messages (batch_min={MIN_MESSAGES_PER_BATCH}, total={total})")
         except Exception as err:
           if STOP:
             break
-          log(f"Producer stream interrupted. Retrying in {backoff}s. Reason: {err}")
+          log(f"Consumer stream interrupted. Retrying in {backoff}s. Reason: {err}")
           sleep_interruptible(backoff)
           backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
         finally:
-          if producer is not None:
+          if consumer is not None:
             try:
-              producer.flush(5)
+              consumer.close()
             except Exception:
               pass
 
