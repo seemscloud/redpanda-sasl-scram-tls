@@ -1,0 +1,64 @@
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: Console
+metadata:
+  name: redpanda
+spec:
+  nodeSelector:
+    node-role.kubernetes.io/elastic: ""
+  tolerations:
+  - key: node-role.kubernetes.io/elastic
+    operator: Exists
+    effect: NoSchedule
+  replicaCount: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: "100%"
+  cluster:
+    staticConfiguration:
+      kafka:
+        brokers:
+        - redpanda-0.redpanda.{{ .Release.Namespace }}.svc.cluster.local.:9093
+        - redpanda-1.redpanda.{{ .Release.Namespace }}.svc.cluster.local.:9093
+        - redpanda-2.redpanda.{{ .Release.Namespace }}.svc.cluster.local.:9093
+        sasl:
+          mechanism: SCRAM-SHA-512
+          username: redpanda-admin
+          password:
+            secretKeyRef:
+              name: redpanda-admin-users
+              key: redpanda-admin-password
+        tls:
+          enabled: true
+          caCert:
+            secretKeyRef:
+              name: redpanda-default-cert
+              key: ca.crt
+      admin:
+        urls:
+        - https://redpanda.{{ .Release.Namespace }}.svc.cluster.local.:9644
+        tls:
+          enabled: true
+          caCert:
+            secretKeyRef:
+              name: redpanda-default-cert
+              key: ca.crt
+      schemaRegistry:
+        urls:
+        - https://redpanda-0.redpanda.{{ .Release.Namespace }}.svc.cluster.local.:8081
+        - https://redpanda-1.redpanda.{{ .Release.Namespace }}.svc.cluster.local.:8081
+        - https://redpanda-2.redpanda.{{ .Release.Namespace }}.svc.cluster.local.:8081
+        sasl:
+          mechanism: SCRAM-SHA-512
+          username: redpanda-admin
+          password:
+            secretKeyRef:
+              name: redpanda-admin-users
+              key: redpanda-admin-password
+        tls:
+          enabled: true
+          caCert:
+            secretKeyRef:
+              name: redpanda-default-cert
+              key: ca.crt

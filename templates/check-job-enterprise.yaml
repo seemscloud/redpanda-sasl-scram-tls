@@ -1,0 +1,116 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: redpanda-config-check
+  labels:
+    app.kubernetes.io/name: redpanda-config-check
+    redpanda.com/check-job: "true"
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "50"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redpanda-config-check
+        redpanda.com/check-job: "true"
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      containers:
+      - name: check
+        image: docker.redpanda.com/redpandadata/redpanda:v25.3.1
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+
+          ADMIN_HOST="redpanda.{{ .Release.Namespace }}.svc.cluster.local.:9644"
+          CA_FILE="/etc/redpanda-ca/ca.crt"
+          ATTEMPTS=120
+          SLEEP_SECONDS=5
+
+          echo "Waiting for Redpanda API and CA cert..."
+          i=1
+          while [ "$i" -le "$ATTEMPTS" ]; do
+            if [ -f "$CA_FILE" ] && \
+              rpk cluster config get core_balancing_continuous \
+                -X admin.hosts="$ADMIN_HOST" \
+                -X admin.tls.enabled=true \
+                -X admin.tls.ca="$CA_FILE" >/tmp/core.txt 2>/tmp/check.err; then
+              break
+            fi
+
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "Still waiting... attempt ${i}/${ATTEMPTS}"
+              if [ -s /tmp/check.err ]; then
+                cat /tmp/check.err || true
+              fi
+            fi
+            i=$((i + 1))
+            sleep "$SLEEP_SECONDS"
+          done
+
+          if [ "$i" -gt "$ATTEMPTS" ]; then
+            echo "Timed out waiting for Redpanda readiness."
+            if [ -s /tmp/check.err ]; then
+              cat /tmp/check.err || true
+            fi
+            exit 1
+          fi
+
+          core="$(tr -d '\r\n' </tmp/core.txt)"
+          mode="$(
+            rpk cluster config get partition_autobalancing_mode \
+              -X admin.hosts="$ADMIN_HOST" \
+              -X admin.tls.enabled=true \
+              -X admin.tls.ca="$CA_FILE" | tr -d '\r\n'
+          )"
+          license_json="$(
+            rpk cluster license info --format json \
+              -X admin.hosts="$ADMIN_HOST" \
+              -X admin.tls.enabled=true \
+              -X admin.tls.ca="$CA_FILE"
+          )"
+
+          echo "core_balancing_continuous=${core}"
+          echo "partition_autobalancing_mode=${mode}"
+          echo "${license_json}"
+
+          [ "$core" = "false" ] || {
+            echo "Expected core_balancing_continuous=false, got: $core"
+            exit 1
+          }
+
+          [ "$mode" = "node_add" ] || {
+            echo "Expected partition_autobalancing_mode=node_add, got: $mode"
+            exit 1
+          }
+
+          echo "$license_json" | grep -q '"license_violation":false' || {
+            echo "License violation must be false."
+            exit 1
+          }
+
+          echo "$license_json" | grep -q '"enterprise_features_in_use":\[\]' || {
+            echo "enterprise_features_in_use must be empty."
+            exit 1
+          }
+
+          echo "Redpanda post-install/post-upgrade checks passed."
+        volumeMounts:
+        - name: redpanda-default-ca
+          mountPath: /etc/redpanda-ca
+          readOnly: true
+      volumes:
+      - name: redpanda-default-ca
+        secret:
+          secretName: redpanda-default-cert
+          optional: true
+          items:
+          - key: ca.crt
+            path: ca.crt

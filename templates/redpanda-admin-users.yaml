@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redpanda-admin-users
+type: Opaque
+stringData:
+  users.txt: redpanda-admin:ChangeMe_RedpandaAdmin_123!:SCRAM-SHA-512
+  redpanda-admin-password: ChangeMe_RedpandaAdmin_123!

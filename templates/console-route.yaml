@@ -1,0 +1,15 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: redpanda-console
+spec:
+  host: redpanda-console-katana.apps.okd-gcp-test.lppdev.pl
+  to:
+    kind: Service
+    name: redpanda-console
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

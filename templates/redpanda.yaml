@@ -1,0 +1,52 @@
+apiVersion: cluster.redpanda.com/v1alpha2
+kind: Redpanda
+metadata:
+  name: redpanda
+spec:
+  chartRef: {}
+  clusterSpec:
+    statefulset:
+      replicas: 3
+      nodeSelector:
+        node-role.kubernetes.io/elastic: ""
+      tolerations:
+      - key: node-role.kubernetes.io/elastic
+        operator: Exists
+        effect: NoSchedule
+    resources:
+      requests:
+        cpu: "1"
+        memory: 4Gi
+    config:
+      cluster:
+        core_balancing_continuous: false
+        partition_autobalancing_mode: node_add
+    external:
+      enabled: false
+    auth:
+      sasl:
+        enabled: true
+        mechanism: SCRAM-SHA-512
+        secretRef: redpanda-admin-users
+    tls:
+      enabled: true
+    listeners:
+      kafka:
+        tls:
+          enabled: true
+      admin:
+        tls:
+          enabled: true
+      schemaRegistry:
+        tls:
+          enabled: true
+      http:
+        tls:
+          enabled: true
+      rpc:
+        tls:
+          enabled: true
+    console:
+      enabled: false
+    monitoring:
+      enabled: true

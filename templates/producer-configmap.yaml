@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redpanda-producer
+  labels:
+    app.kubernetes.io/name: redpanda-producer
+data:
+  producer.sh: |
+    #!/usr/bin/env sh
+    set -eu
+
+    log() {
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [redpanda-producer] $*"
+    }
+
+    TOPIC="${TOPIC:-logs}"
+    BROKER_SERVICE="${BROKER_SERVICE:-redpanda}"
+    BROKER_PORT="${BROKER_PORT:-9093}"
+    NAMESPACE="${NAMESPACE:-default}"
+    BROKER="${BROKER_SERVICE}.${NAMESPACE}.svc.cluster.local.:${BROKER_PORT}"
+
+    KAFKA_USERNAME="${KAFKA_USERNAME:-producer}"
+    KAFKA_PASSWORD_FILE="${KAFKA_PASSWORD_FILE:-/etc/redpanda/auth/password}"
+    CA_FILE="${CA_FILE:-/etc/redpanda/certs/ca.crt}"
+
+    # 10 messages every 0.1s ~= 100 messages/s.
+    MESSAGES_PER_BATCH="${MESSAGES_PER_BATCH:-10}"
+    BATCH_INTERVAL_SECONDS="${BATCH_INTERVAL_SECONDS:-0.1}"
+    MAX_BACKOFF_SECONDS="${MAX_BACKOFF_SECONDS:-30}"
+
+    if [ "${MESSAGES_PER_BATCH}" -lt 1 ]; then
+      log "MESSAGES_PER_BATCH must be >= 1"
+      exit 1
+    fi
+
+    wait_for_dependencies() {
+      while [ ! -s "${KAFKA_PASSWORD_FILE}" ] || [ ! -s "${CA_FILE}" ]; do
+        log "Waiting for mounted secrets (${KAFKA_PASSWORD_FILE}, ${CA_FILE})..."
+        sleep 2
+      done
+    }
+
+    read_password() {
+      tr -d '\r\n' < "${KAFKA_PASSWORD_FILE}"
+    }
+
+    check_cluster() {
+      password="$(read_password)"
+      rpk cluster info \
+        -X brokers="${BROKER}" \
+        -X user="${KAFKA_USERNAME}" \
+        -X pass="${password}" \
+        -X sasl.mechanism=SCRAM-SHA-512 \
+        -X tls.enabled=true \
+        -X tls.ca="${CA_FILE}" >/dev/null 2>&1
+    }
+
+    generate_messages() {
+      seq=0
+      while true; do
+        i=0
+        now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        while [ "${i}" -lt "${MESSAGES_PER_BATCH}" ]; do
+          seq=$((seq + 1))
+          printf '{"producer":"redpanda-producer","topic":"%s","sequence":%s,"sent_at":"%s"}\n' "${TOPIC}" "${seq}" "${now}"
+          i=$((i + 1))
+        done
+        sleep "${BATCH_INTERVAL_SECONDS}"
+      done
+    }
+
+    stream_messages() {
+      password="$(read_password)"
+      generate_messages | rpk topic produce "${TOPIC}" -f '%v\n' \
+        -X brokers="${BROKER}" \
+        -X user="${KAFKA_USERNAME}" \
+        -X pass="${password}" \
+        -X sasl.mechanism=SCRAM-SHA-512 \
+        -X tls.enabled=true \
+        -X tls.ca="${CA_FILE}"
+    }
+
+    on_term() {
+      log "Received termination signal. Exiting."
+      exit 0
+    }
+
+    trap on_term INT TERM
+
+    wait_for_dependencies
+    log "Producer configured. topic=${TOPIC} broker=${BROKER} user=${KAFKA_USERNAME}"
+    log "Target throughput: ~100 msg/s (MESSAGES_PER_BATCH=${MESSAGES_PER_BATCH}, BATCH_INTERVAL_SECONDS=${BATCH_INTERVAL_SECONDS})"
+
+    backoff=1
+    while true; do
+      if ! check_cluster; then
+        log "Connectivity check failed (DNS/network/TLS/SASL). Retrying in ${backoff}s."
+        sleep "${backoff}"
+        backoff=$((backoff * 2))
+        if [ "${backoff}" -gt "${MAX_BACKOFF_SECONDS}" ]; then
+          backoff="${MAX_BACKOFF_SECONDS}"
+        fi
+        continue
+      fi
+
+      backoff=1
+      log "Connected to Redpanda. Starting producer stream."
+      if ! stream_messages; then
+        log "Producer stream interrupted. Retrying in ${backoff}s."
+        sleep "${backoff}"
+        backoff=$((backoff * 2))
+        if [ "${backoff}" -gt "${MAX_BACKOFF_SECONDS}" ]; then
+          backoff="${MAX_BACKOFF_SECONDS}"
+        fi
+      fi
+    done
